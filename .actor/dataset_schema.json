@@ -1,0 +1,92 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "type": "object",
+    "properties": {
+      "asin": {
+        "type": "string",
+        "description": "Amazon Standard Identification Number (10 characters)"
+      },
+      "title": {
+        "type": "string",
+        "description": "Full product title"
+      },
+      "price": {
+        "type": "number",
+        "description": "Current active BuyBox price"
+      },
+      "listPrice": {
+        "type": "number",
+        "description": "Original manufacturer list price"
+      },
+      "currency": {
+        "type": "string",
+        "description": "Currency symbol or ISO code (USD, EUR, GBP, etc.)"
+      },
+      "rating": {
+        "type": "number",
+        "description": "Average customer star rating (0.0 to 5.0)"
+      },
+      "reviewsCount": {
+        "type": "integer",
+        "description": "Total customer ratings and reviews count"
+      },
+      "inStock": {
+        "type": "boolean",
+        "description": "Availability in stock flag"
+      },
+      "stockMessage": {
+        "type": "string",
+        "description": "Stock status text (e.g. In Stock, Only 2 left in stock)"
+      },
+      "brand": {
+        "type": "string",
+        "description": "Brand or manufacturer name"
+      },
+      "seller": {
+        "type": "string",
+        "description": "BuyBox merchant or seller name"
+      },
+      "fulfilledBy": {
+        "type": "string",
+        "description": "Fulfillment method (Amazon FBA or Merchant FBM)"
+      },
+      "isPrime": {
+        "type": "boolean",
+        "description": "Prime shipping eligibility"
+      },
+      "bsr": {
+        "type": "string",
+        "description": "Best Sellers Rank in main or sub-categories"
+      },
+      "coupon": {
+        "type": "string",
+        "description": "Active coupon or clip-and-save discount"
+      },
+      "features": {
+        "type": "array",
+        "description": "Bullet points from 'About this item'"
+      },
+      "description": {
+        "type": "string",
+        "description": "Detailed product description text"
+      },
+      "thumbnail": {
+        "type": "string",
+        "description": "Primary high-resolution product image URL"
+      },
+      "images": {
+        "type": "array",
+        "description": "Full list of high-res gallery images"
+      },
+      "url": {
+        "type": "string",
+        "description": "Canonical Amazon product URL"
+      },
+      "scrapedAt": {
+        "type": "string",
+        "description": "Timestamp of extraction"
+      }
+    }
+  }
+}
