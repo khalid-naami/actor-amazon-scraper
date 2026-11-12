@@ -1,0 +1,16 @@
+{
+  "actorSpecification": 1,
+  "name": "amazon-scraper",
+  "title": "Amazon Ultimate Scraper (Products, BuyBox, BSR & Reviews)",
+  "description": "Amazon Scraper: Extract product details, live BuyBox prices, BSR sales ranks, ASIN variations, customer reviews, ratings, Prime status, coupons, and seller inventory from any Amazon domain worldwide. Built for e-commerce arbitrage, automated price tracking, and deep market research at scale.",
+  "version": "1.0",
+  "meta": {
+    "templateId": "js-crawlee-playwright"
+  },
+  "dockerfile": "../Dockerfile",
+  "input": "./input_schema.json",
+  "storages": {
+    "dataset": "./dataset_schema.json"
+  },
+  "output": "./output_schema.json"
+}
