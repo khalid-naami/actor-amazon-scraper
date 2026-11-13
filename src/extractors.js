@@ -15,31 +15,98 @@ export function extractAsin(input) {
     return match ? match[1].toUpperCase() : null;
 }
 
+function decodeHtmlEntities(str) {
+    if (!str || typeof str !== 'string') return str;
+    return str
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&#x27;/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+export function detectAmazonPageState(html, statusCode = 200) {
+    if (statusCode === 404) {
+        return { state: 'unavailable', reason: 'HTTP 404 (Product not found on this marketplace)' };
+    }
+    if (statusCode === 503 || statusCode === 429 || statusCode === 403) {
+        return { state: 'antibot_challenge', reason: `HTTP ${statusCode} Amazon anti-bot throttle/service block` };
+    }
+    if (statusCode >= 400) {
+        return { state: 'http_error', reason: `HTTP ${statusCode}` };
+    }
+    if (!html || typeof html !== 'string' || html.trim().length < 20) {
+        return { state: 'empty_body', reason: 'Empty or truncated HTML response' };
+    }
+    const lower = html.toLowerCase();
+    if (
+        lower.includes('api-services-support@amazon.com') ||
+        lower.includes('enter the characters you see below') ||
+        lower.includes('type the characters you see in this image') ||
+        lower.includes('validatecaptcha') ||
+        lower.includes('opfcaptcha')
+    ) {
+        return {
+            state: 'antibot_challenge',
+            reason: 'Amazon CAPTCHA / Robot Check gate detected; enable Apify RESIDENTIAL proxy',
+        };
+    }
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const pageTitle = titleMatch ? decodeHtmlEntities(titleMatch[1]) : '';
+    if (/page not found/i.test(pageTitle) || lower.includes("we couldn't find that page")) {
+        return { state: 'unavailable', reason: pageTitle || 'Page Not Found' };
+    }
+    if (html.trim().length < 200) {
+        return { state: 'empty_body', reason: 'Empty or truncated HTML response' };
+    }
+    return { state: 'ok', reason: pageTitle || 'OK' };
+}
+
 /**
  * Clean numeric price from string
  */
 export function parseAmazonPrice(raw) {
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
     if (!raw || typeof raw !== 'string') return null;
     const match = raw.replace(/,/g, '').match(/([0-9]+\.[0-9]{2}|[0-9]+)/);
-    return match ? parseFloat(match[1]) : null;
+    if (!match) return null;
+    const num = parseFloat(match[1]);
+    return Number.isFinite(num) ? num : null;
 }
 
 /**
  * Clean star rating
  */
 export function parseAmazonRating(raw) {
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
     if (!raw || typeof raw !== 'string') return null;
     const match = raw.replace(',', '.').match(/([0-5]\.[0-9]|[0-5])/);
-    return match ? parseFloat(match[1]) : null;
+    if (!match) return null;
+    const num = parseFloat(match[1]);
+    return Number.isFinite(num) ? num : null;
 }
 
 /**
  * Clean review count
  */
 export function parseAmazonReviewsCount(raw) {
+    if (typeof raw === 'number') return Number.isFinite(raw) ? Math.trunc(raw) : 0;
     if (!raw || typeof raw !== 'string') return 0;
     const digits = raw.replace(/[^\d]/g, '');
     return digits ? parseInt(digits, 10) : 0;
+}
+
+export function domainToCurrency(domain = 'amazon.com') {
+    if (domain.includes('.co.uk')) return 'GBP';
+    if (domain.includes('.de') || domain.includes('.fr') || domain.includes('.es') || domain.includes('.it')) return 'EUR';
+    if (domain.includes('.ca')) return 'CAD';
+    if (domain.includes('.co.jp')) return 'JPY';
+    if (domain.includes('.sa')) return 'SAR';
+    if (domain.includes('.ae')) return 'AED';
+    return 'USD';
 }
 
 /**
@@ -77,13 +144,20 @@ export function parseAmazonGallery(html) {
  * Extract full product details from Amazon Product HTML
  */
 export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
-    if (!html) return null;
+    if (!html || typeof html !== 'string') return null;
+
+    const stateCheck = detectAmazonPageState(html, 200);
+    if (stateCheck.state === 'antibot_challenge' || stateCheck.state === 'unavailable') {
+        return null;
+    }
 
     // Title
     let title = null;
-    const titleMatch = html.match(/id="productTitle"[^>]*>([\s\S]*?)<\/span>/i) || html.match(/id="title"[^>]*>([\s\S]*?)<\/h1>/i);
+    const titleMatch =
+        html.match(/id="productTitle"[^>]*>([\s\S]*?)<\/span>/i) ||
+        html.match(/id="title"[^>]*>([\s\S]*?)<\/h1>/i);
     if (titleMatch) {
-        title = titleMatch[1].trim();
+        title = decodeHtmlEntities(titleMatch[1].replace(/<[^>]+>/g, ''));
     }
 
     // Price
@@ -93,6 +167,7 @@ export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
         /class="a-price aok-align-center[^"]*"[^>]*>[\s\S]*?<span class="a-offscreen">([^<]+)<\/span>/i,
         /id="corePriceDisplay_desktop_feature_div"[^>]*>[\s\S]*?<span class="a-offscreen">([^<]+)<\/span>/i,
         /id="corePrice_feature_div"[^>]*>[\s\S]*?<span class="a-offscreen">([^<]+)<\/span>/i,
+        /class="[^"]*(?:apexPriceToPay|reinventPricePriceToPayMargin)[^"]*"[^>]*>[\s\S]*?<span class="a-offscreen">([^<]+)<\/span>/i,
         /id="price_inside_buybox"[^>]*>([^<]+)<\/span>/i,
         /id="priceblock_ourprice"[^>]*>([^<]+)<\/span>/i,
     ];
@@ -111,19 +186,13 @@ export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
         listPrice = parseAmazonPrice(listPriceMatch[1]);
     }
 
-    // Currency
-    let currency = 'USD';
-    if (domain.includes('.co.uk')) currency = 'GBP';
-    else if (domain.includes('.de') || domain.includes('.fr') || domain.includes('.es') || domain.includes('.it')) currency = 'EUR';
-    else if (domain.includes('.ca')) currency = 'CAD';
-    else if (domain.includes('.co.jp')) currency = 'JPY';
-    else if (domain.includes('.sa')) currency = 'SAR';
-    else if (domain.includes('.ae')) currency = 'AED';
+    const currency = domainToCurrency(domain);
 
     // Rating & Reviews
     let rating = null;
-    const ratingMatch = html.match(/<span class="a-icon-alt">([0-9.,]+ out of 5 stars|[0-9.,]+ von 5 Sternen|[0-9.,]+ sur 5 étoiles)<\/span>/i) ||
-                        html.match(/id="acrPopover"[^>]*title="([^"]+)"/i);
+    const ratingMatch =
+        html.match(/<span class="a-icon-alt">([0-9.,]+ out of 5 stars|[0-9.,]+ von 5 Sternen|[0-9.,]+ sur 5 étoiles)<\/span>/i) ||
+        html.match(/id="acrPopover"[^>]*title="([^"]+)"/i);
     if (ratingMatch) {
         rating = parseAmazonRating(ratingMatch[1]);
     }
@@ -139,7 +208,7 @@ export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
     let stockMessage = 'In Stock';
     const availMatch = html.match(/id="availability"[^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/i);
     if (availMatch) {
-        stockMessage = availMatch[1].trim();
+        stockMessage = decodeHtmlEntities(availMatch[1].replace(/<[^>]+>/g, '')) || 'In Stock';
         const lower = stockMessage.toLowerCase();
         if (lower.includes('currently unavailable') || lower.includes('out of stock')) {
             inStock = false;
@@ -149,35 +218,39 @@ export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
     // Seller & Fulfillment
     let seller = null;
     let fulfilledBy = null;
-    const sellerMatch = html.match(/id="sellerProfileTriggerId"[^>]*>([^<]+)<\/a>/i) ||
-                        html.match(/tabular-attribute-name="Sold by"[^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/i);
-    if (sellerMatch) seller = sellerMatch[1].trim();
+    const sellerMatch =
+        html.match(/id="sellerProfileTriggerId"[^>]*>([^<]+)<\/a>/i) ||
+        html.match(/tabular-attribute-name="Sold by"[^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/i);
+    if (sellerMatch) seller = decodeHtmlEntities(sellerMatch[1].replace(/<[^>]+>/g, ''));
 
     const shipsMatch = html.match(/tabular-attribute-name="Ships from"[^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/i);
-    if (shipsMatch) fulfilledBy = shipsMatch[1].trim();
+    if (shipsMatch) fulfilledBy = decodeHtmlEntities(shipsMatch[1].replace(/<[^>]+>/g, ''));
 
     // Brand
     let brand = null;
-    const brandMatch = html.match(/id="bylineInfo"[^>]*>([^<]+)<\/a>/i) ||
-                       html.match(/class="po-brand"[^>]*>[\s\S]*?<span class="a-size-base po-break-word">([^<]+)<\/span>/i);
+    const brandMatch =
+        html.match(/id="bylineInfo"[^>]*>([^<]+)<\/a>/i) ||
+        html.match(/class="po-brand"[^>]*>[\s\S]*?<span class="a-size-base po-break-word">([^<]+)<\/span>/i);
     if (brandMatch) {
-        brand = brandMatch[1].replace(/^(Brand:\s*|Visit the\s*|Store)/i, '').trim();
+        brand = decodeHtmlEntities(brandMatch[1]).replace(/^(Brand:\s*|Visit the\s*|Store)/i, '').trim();
     }
 
     // Best Sellers Rank (BSR)
     let bsr = null;
-    const bsrMatch = html.match(/Best Sellers Rank:[^<]*<\/th>[\s\S]*?<td>([\s\S]*?)<\/td>/i) ||
-                     html.match(/id="SalesRank"[^>]*>([\s\S]*?)<\/li>/i);
+    const bsrMatch =
+        html.match(/Best Sellers Rank:[^<]*<\/th>[\s\S]*?<td>([\s\S]*?)<\/td>/i) ||
+        html.match(/id="SalesRank"[^>]*>([\s\S]*?)<\/li>/i);
     if (bsrMatch) {
-        bsr = bsrMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        bsr = decodeHtmlEntities(bsrMatch[1].replace(/<[^>]+>/g, ' '));
     }
 
     // Coupon
     let coupon = null;
-    const couponMatch = html.match(/class="couponBadge"[^>]*>([^<]+)<\/span>/i) ||
-                        html.match(/label for="checkbox"[^>]*>([\s\S]*?)<\/label>/i);
+    const couponMatch =
+        html.match(/class="couponBadge"[^>]*>([^<]+)<\/span>/i) ||
+        html.match(/label for="checkbox"[^>]*>([\s\S]*?)<\/label>/i);
     if (couponMatch) {
-        coupon = couponMatch[1].replace(/\s+/g, ' ').trim();
+        coupon = decodeHtmlEntities(couponMatch[1].replace(/<[^>]+>/g, ' '));
     }
 
     // Prime
@@ -189,7 +262,7 @@ export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
     if (featureBlock) {
         const bullets = [...featureBlock[1].matchAll(/<span class="a-list-item"[^>]*>([\s\S]*?)<\/span>/gi)];
         for (const b of bullets) {
-            const text = b[1].replace(/<[^>]+>/g, '').trim();
+            const text = decodeHtmlEntities(b[1].replace(/<[^>]+>/g, ''));
             if (text && !text.includes('Make sure this fits')) {
                 features.push(text);
             }
@@ -203,6 +276,8 @@ export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
     // Canonical URL
     const canonicalMatch = html.match(/<link rel="canonical" href="([^"]+)"/i);
     const canonicalUrl = canonicalMatch ? canonicalMatch[1] : `https://www.${domain}/dp/${asin}`;
+
+    if (!title) return null;
 
     return {
         asin,
@@ -229,48 +304,44 @@ export function parseAmazonProductHtml(html, asin, domain = 'amazon.com') {
 }
 
 /**
- * Extract items from Amazon Search SERP HTML
+ * Extract items from Amazon Search SERP HTML (supports both <a><h2><span> and <h2><a><span> layouts)
  */
 export function parseAmazonSearchHtml(html, domain = 'amazon.com') {
     const results = [];
-    if (!html) return results;
+    if (!html || typeof html !== 'string') return results;
 
-    const cards = [...html.matchAll(/data-component-type="s-search-result"[^>]*data-asin="([A-Z0-9]{10})"[\s\S]*?(?=<div data-component-type="s-search-result"|$)/gi)];
+    const stateCheck = detectAmazonPageState(html, 200);
+    if (stateCheck.state === 'antibot_challenge') return results;
+
+    const cards = [...html.matchAll(/data-component-type="s-search-result"[^>]*data-asin="([A-Z0-9]{10})"[\s\S]*?(?=<div[^>]*data-component-type="s-search-result"|$)/gi)];
+    const currency = domainToCurrency(domain);
 
     for (const card of cards) {
-        const asin = card[1];
+        const asin = card[1].toUpperCase();
         const cardHtml = card[0];
 
-        // Title & URL
-        const titleMatch = cardHtml.match(/<h2[^>]*>[\s\S]*?<a[^>]*href="([^"]+)"[^>]*>[\s\S]*?<span[^>]*>([^<]+)<\/span>/i);
-        if (!titleMatch) continue;
+        // Title across both <h2 ...><a><span>Title</span></a></h2> and <a><h2 ...><span>Title</span></h2></a>
+        const h2Match = cardHtml.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i);
+        const rawTitle = h2Match ? h2Match[1].replace(/<[^>]+>/g, ' ') : '';
+        const title = decodeHtmlEntities(rawTitle);
+        if (!title) continue;
 
-        const urlPath = titleMatch[1];
-        const title = titleMatch[2].trim();
+        const hrefMatch =
+            cardHtml.match(/<a[^>]*class="[^"]*a-link-normal[^"]*"[^>]*href="([^"]*\/dp\/[A-Z0-9]{10}[^"]*)"/i) ||
+            cardHtml.match(/<a[^>]*href="([^"]*(?:\/dp\/|\/sspa\/click)[^"]*)"/i);
+        const urlPath = hrefMatch ? decodeHtmlEntities(hrefMatch[1]) : `/dp/${asin}`;
         const fullUrl = urlPath.startsWith('http') ? urlPath : `https://www.${domain}${urlPath}`;
 
-        // Price
         const priceMatch = cardHtml.match(/class="a-price"[^>]*>[\s\S]*?<span class="a-offscreen">([^<]+)<\/span>/i);
         const price = priceMatch ? parseAmazonPrice(priceMatch[1]) : null;
 
-        // Rating
-        const ratingMatch = cardHtml.match(/<span class="a-icon-alt">([0-9.,]+ out of 5 stars)<\/span>/i);
+        const ratingMatch = cardHtml.match(/<span class="a-icon-alt">([0-9.,]+ out of 5 stars|[0-9.,]+ von 5 Sternen|[0-9.,]+ sur 5 étoiles)<\/span>/i);
         const rating = ratingMatch ? parseAmazonRating(ratingMatch[1]) : null;
 
-        // Image
         const imgMatch = cardHtml.match(/class="s-image"[^>]*src="([^"]+)"/i);
         const thumbnail = imgMatch ? imgMatch[1] : null;
 
-        // Prime
         const isPrime = cardHtml.includes('aria-label="Amazon Prime"') || cardHtml.includes('a-icon-prime');
-
-        let currency = 'USD';
-        if (domain.includes('.co.uk')) currency = 'GBP';
-        else if (domain.includes('.de') || domain.includes('.fr') || domain.includes('.es') || domain.includes('.it')) currency = 'EUR';
-        else if (domain.includes('.ca')) currency = 'CAD';
-        else if (domain.includes('.co.jp')) currency = 'JPY';
-        else if (domain.includes('.sa')) currency = 'SAR';
-        else if (domain.includes('.ae')) currency = 'AED';
 
         results.push({
             asin,
