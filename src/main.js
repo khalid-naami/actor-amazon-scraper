@@ -7,12 +7,33 @@ import {
     parseAmazonSearchHtml,
 } from './extractors.js';
 
+function sanitizeRecord(obj) {
+    if (Array.isArray(obj)) return obj.map((item) => sanitizeRecord(item));
+    if (!obj || typeof obj !== 'object') return obj;
+    const clean = {};
+    for (const [k, v] of Object.entries(obj)) {
+        if (v !== null && v !== undefined && !(typeof v === 'number' && !Number.isFinite(v))) {
+            clean[k] = Array.isArray(v)
+                ? v.map((item) => (item && typeof item === 'object' ? sanitizeRecord(item) : item))
+                : v && typeof v === 'object' && !(v instanceof Date)
+                    ? sanitizeRecord(v)
+                    : v;
+        }
+    }
+    return clean;
+}
+
+function isProxyTransportError(errOrStatus) {
+    const msg = String(errOrStatus?.message || errOrStatus || '');
+    return errOrStatus === 597 || errOrStatus === 407 || /597|UPSTREAM407|407|Proxy responded with|tunneling socket/i.test(msg);
+}
+
 await Actor.init();
 
 try {
     const input = (await Actor.getInput()) || {};
     const {
-        asins = ['B08N5WRWNW', 'B09XS7JWHH'],
+        asins = [],
         productUrls = [],
         searchKeywords = [],
         amazonDomain = 'amazon.com',
@@ -23,14 +44,34 @@ try {
     log.info(`Starting Amazon Ultimate Scraper for domain: ${amazonDomain}...`);
 
     // Setup Proxy
+    let proxyConfig = null;
     let proxyUrl = undefined;
     if (proxyConfiguration) {
-        const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
-        if (proxyConfig) {
-            proxyUrl = await proxyConfig.newUrl();
-            log.info('Proxy configured successfully');
+        try {
+            proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
+            if (proxyConfig) {
+                proxyUrl = await proxyConfig.newUrl();
+                log.info('Proxy configured successfully');
+            }
+        } catch (proxyErr) {
+            log.warning(`Proxy initialization failed (${proxyErr.message}); continuing with direct connection.`);
         }
     }
+
+    const rotateOrDisableProxy = async (err) => {
+        if (!isProxyTransportError(err)) return;
+        if (proxyConfig) {
+            try {
+                proxyUrl = await proxyConfig.newUrl();
+                log.warning('Rotated Apify Proxy session after upstream proxy transport error.');
+                return;
+            } catch {
+                // Fall through to disable proxy
+            }
+        }
+        proxyUrl = undefined;
+        log.warning('Disabled broken proxy session; falling back to direct connection.');
+    };
 
     let totalProductsScraped = 0;
     let inStockCount = 0;
@@ -78,9 +119,14 @@ try {
 
     if (Array.isArray(productUrls)) {
         for (const u of productUrls) {
-            const asin = extractAsin(u);
+            const asin = extractAsin(typeof u === 'string' ? u : u?.url);
             if (asin) targetAsins.add(asin);
         }
+    }
+
+    if (targetAsins.size === 0 && (!Array.isArray(searchKeywords) || searchKeywords.length === 0)) {
+        targetAsins.add('B08N5WRWNW');
+        targetAsins.add('B09XS7JWHH');
     }
 
     // Process Direct ASINs
@@ -110,6 +156,7 @@ try {
                     product = parseAmazonProductHtml(html, asin, amazonDomain);
                 }
             } catch (gotErr) {
+                await rotateOrDisableProxy(gotErr);
                 log.debug(`gotScraping failed for ${asin}: ${gotErr.message}`);
             }
 
@@ -126,12 +173,13 @@ try {
                     product = parseAmazonProductHtml(html, asin, amazonDomain);
                     await page.close();
                 } catch (bErr) {
+                    await rotateOrDisableProxy(bErr);
                     log.warning(`Browser fallback error for ${asin}: ${bErr.message}`);
                 }
             }
 
             if (product && product.title) {
-                await Actor.pushData(product);
+                await Actor.pushData(sanitizeRecord(product));
                 totalProductsScraped++;
                 if (product.inStock) inStockCount++;
                 if (product.isPrime) primeProductsCount++;
@@ -169,6 +217,7 @@ try {
                     });
                     html = response.body;
                 } catch (err) {
+                    await rotateOrDisableProxy(err);
                     log.debug(`Direct search request failed: ${err.message}`);
                 }
 
@@ -186,7 +235,7 @@ try {
 
                 for (const item of sliced) {
                     item.searchKeyword = keyword;
-                    await Actor.pushData(item);
+                    await Actor.pushData(sanitizeRecord(item));
                     totalProductsScraped++;
                     if (item.isPrime) primeProductsCount++;
                 }
@@ -209,16 +258,20 @@ try {
         inStockCount,
         primeProductsCount,
         domain: amazonDomain,
-        status: 'SUCCEEDED',
+        status: totalProductsScraped > 0 ? 'SUCCEEDED' : 'FAILED',
         scrapedAt: new Date().toISOString(),
     };
 
     await Actor.setValue('OUTPUT', summary);
+    if (totalProductsScraped === 0) {
+        await Actor.fail('Extracted 0 products. Verify target URLs, keywords, or proxy configuration.');
+    }
     log.info(`Amazon Scraping finished successfully! Total items: ${totalProductsScraped}`);
 
 } catch (err) {
     log.error(`Fatal execution error: ${err.message}`, { stack: err.stack });
     await Actor.setValue('OUTPUT', { status: 'FAILED', error: err.message });
+    await Actor.fail(err.message);
 } finally {
     await Actor.exit();
 }
