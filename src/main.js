@@ -2,33 +2,66 @@ import { Actor, log } from 'apify';
 import { gotScraping } from 'got-scraping';
 import { chromium } from 'playwright';
 import {
+    detectAmazonPageState,
+    domainToCurrency,
     extractAsin,
+    parseAmazonPrice,
     parseAmazonProductHtml,
+    parseAmazonRating,
     parseAmazonSearchHtml,
 } from './extractors.js';
 
 function sanitizeRecord(obj) {
-    if (Array.isArray(obj)) return obj.map((item) => sanitizeRecord(item));
-    if (!obj || typeof obj !== 'object') return obj;
-    const clean = {};
-    for (const [k, v] of Object.entries(obj)) {
-        if (v !== null && v !== undefined && !(typeof v === 'number' && !Number.isFinite(v))) {
-            clean[k] = Array.isArray(v)
-                ? v.map((item) => (item && typeof item === 'object' ? sanitizeRecord(item) : item))
-                : v && typeof v === 'object' && !(v instanceof Date)
-                    ? sanitizeRecord(v)
-                    : v;
-        }
+    if (obj === null || obj === undefined) return undefined;
+    if (typeof obj === 'number') return Number.isFinite(obj) ? obj : undefined;
+    if (Array.isArray(obj)) {
+        return obj.map(sanitizeRecord).filter((v) => v !== undefined);
     }
-    return clean;
+    if (typeof obj === 'object' && !(obj instanceof Date)) {
+        const clean = {};
+        for (const [k, v] of Object.entries(obj)) {
+            const val = sanitizeRecord(v);
+            if (val !== undefined) clean[k] = val;
+        }
+        return clean;
+    }
+    return obj;
 }
 
 function isProxyTransportError(errOrStatus) {
     const msg = String(errOrStatus?.message || errOrStatus || '');
-    return errOrStatus === 597 || errOrStatus === 407 || /597|UPSTREAM407|407|Proxy responded with|tunneling socket/i.test(msg);
+    return (
+        errOrStatus === 597 ||
+        errOrStatus === 407 ||
+        errOrStatus === 502 ||
+        /597|UPSTREAM407|407|Proxy responded with|tunneling socket|ERR_TUNNEL|ERR_PROXY|ECONNRESET/i.test(msg)
+    );
 }
 
 await Actor.init();
+
+let browser = null;
+const diagnostics = [];
+let totalProductsScraped = 0;
+let inStockCount = 0;
+let primeProductsCount = 0;
+
+Actor.on('aborting', async () => {
+    try {
+        if (browser) await browser.close().catch(() => {});
+        await Actor.setValue('OUTPUT', {
+            totalProductsScraped,
+            inStockCount,
+            primeProductsCount,
+            status: 'ABORTED',
+            diagnostics,
+            scrapedAt: new Date().toISOString(),
+        });
+    } catch {
+        // Ignore cleanup errors on abort
+    }
+    await Actor.exit();
+});
 
 try {
     const input = (await Actor.getInput()) || {};
@@ -46,11 +79,13 @@ try {
     // Setup Proxy
     let proxyConfig = null;
     let proxyUrl = undefined;
+    let proxyEnabled = false;
     if (proxyConfiguration) {
         try {
             proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
             if (proxyConfig) {
                 proxyUrl = await proxyConfig.newUrl();
+                proxyEnabled = Boolean(proxyUrl);
                 log.info('Proxy configured successfully');
             }
         } catch (proxyErr) {
@@ -58,27 +93,34 @@ try {
         }
     }
 
-    const rotateOrDisableProxy = async (err) => {
-        if (!isProxyTransportError(err)) return;
-        if (proxyConfig) {
+    const closeBrowser = async () => {
+        if (browser) {
+            await browser.close().catch(() => {});
+            browser = null;
+        }
+    };
+
+    let proxyFailureCount = 0;
+    const rotateOrDisableProxy = async (reason) => {
+        if (!proxyEnabled || !isProxyTransportError(reason)) return false;
+        proxyFailureCount++;
+        await closeBrowser();
+        if (proxyConfig && proxyFailureCount <= 1) {
             try {
                 proxyUrl = await proxyConfig.newUrl();
-                log.warning('Rotated Apify Proxy session after upstream proxy transport error.');
-                return;
+                proxyEnabled = Boolean(proxyUrl);
+                log.warning(`Rotated Apify Proxy session (attempt ${proxyFailureCount}) after upstream proxy transport error.`);
+                return true;
             } catch {
                 // Fall through to disable proxy
             }
         }
         proxyUrl = undefined;
-        log.warning('Disabled broken proxy session; falling back to direct connection.');
+        proxyEnabled = false;
+        log.warning('Disabled failing proxy session (upstream tunnel error or target domain restricted on proxy tier); falling back to direct connection.');
+        return true;
     };
 
-    let totalProductsScraped = 0;
-    let inStockCount = 0;
-    let primeProductsCount = 0;
-
-    // Helper: Browser instance for anti-bot fallback
-    let browser = null;
     const getBrowser = async () => {
         if (!browser) {
             const launchOptions = {
@@ -94,7 +136,7 @@ try {
                 try {
                     const u = new URL(proxyUrl);
                     launchOptions.proxy = {
-                        server: `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`,
+                        server: `${u.protocol}//${u.hostname}${u.port ? `:${u.port}` : ''}`,
                         ...(u.username ? { username: decodeURIComponent(u.username) } : {}),
                         ...(u.password ? { password: decodeURIComponent(u.password) } : {}),
                     };
@@ -105,6 +147,111 @@ try {
             browser = await chromium.launch(launchOptions);
         }
         return browser;
+    };
+
+    const fetchHtmlWithHttp = async (url) => {
+        let lastErr = null;
+        // Up to 3 attempts: initial proxy -> rotated proxy -> direct connection fallback
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const response = await gotScraping({
+                    url,
+                    proxyUrl,
+                    headers: {
+                        'accept-language': 'en-US,en;q=0.9',
+                        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                    },
+                    timeout: { request: 25000 },
+                    throwHttpErrors: false,
+                });
+                const body = response.body || '';
+                const stateInfo = detectAmazonPageState(body, response.statusCode);
+                if (stateInfo.state === 'antibot_challenge' && proxyEnabled && attempt === 1) {
+                    proxyFailureCount++;
+                    await closeBrowser();
+                    if (proxyConfig) {
+                        proxyUrl = await proxyConfig.newUrl().catch(() => undefined);
+                        if (!proxyUrl) proxyEnabled = false;
+                    }
+                    continue;
+                }
+                return { html: body, statusCode: response.statusCode, ...stateInfo };
+            } catch (err) {
+                lastErr = err;
+                const handled = await rotateOrDisableProxy(err);
+                if (handled || attempt < 2) continue;
+                break;
+            }
+        }
+        return { html: '', statusCode: 0, state: 'http_error', reason: lastErr?.message || 'HTTP request failed' };
+    };
+
+    const fetchWithPlaywright = async (url, mode = 'product') => {
+        // Up to 2 attempts: current proxy (or direct) -> direct fallback if ERR_TUNNEL / proxy error
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            let page = null;
+            let context = null;
+            try {
+                const b = await getBrowser();
+                context = await b.newContext({
+                    locale: 'en-US',
+                    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                });
+                page = await context.newPage();
+                await page.route('**/*.{mp4,webm,avi,woff,woff2}', (route) => route.abort());
+
+                const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 35000 });
+                const statusCode = response ? response.status() : 200;
+
+                const waitSel = mode === 'search'
+                    ? '[data-component-type="s-search-result"], form[action*="validateCaptcha"]'
+                    : '#productTitle, #title, form[action*="validateCaptcha"]';
+                await page.waitForSelector(waitSel, { timeout: 8000 }).catch(() => {});
+
+                const html = await page.content();
+                const domFallback = mode === 'search'
+                    ? await page.evaluate(() => {
+                        const items = [];
+                        document.querySelectorAll('[data-component-type="s-search-result"][data-asin]').forEach((el) => {
+                            const asin = el.getAttribute('data-asin');
+                            const h2 = el.querySelector('h2');
+                            const title = h2 ? h2.innerText.trim() : '';
+                            const linkEl = el.querySelector('a[href*="/dp/"]') || el.querySelector('h2 a');
+                            const priceEl = el.querySelector('.a-price .a-offscreen');
+                            const ratingEl = el.querySelector('.a-icon-alt');
+                            const imgEl = el.querySelector('img.s-image');
+                            const isPrime = Boolean(el.querySelector('.a-icon-prime, [aria-label="Amazon Prime"]'));
+                            if (asin && title) {
+                                items.push({
+                                    asin,
+                                    title,
+                                    href: linkEl ? linkEl.getAttribute('href') : `/dp/${asin}`,
+                                    priceText: priceEl ? priceEl.textContent.trim() : null,
+                                    ratingText: ratingEl ? ratingEl.textContent.trim() : null,
+                                    thumbnail: imgEl ? imgEl.src : null,
+                                    isPrime,
+                                });
+                            }
+                        });
+                        return items;
+                    }).catch(() => [])
+                    : [];
+
+                await page.close();
+                await context.close();
+
+                const stateInfo = detectAmazonPageState(html, statusCode);
+                return { html, statusCode, domFallback, ...stateInfo };
+            } catch (bErr) {
+                if (page) await page.close().catch(() => {});
+                if (context) await context.close().catch(() => {});
+                const handled = await rotateOrDisableProxy(bErr);
+                log.warning(`Browser fallback error (${attempt}/2): ${bErr.message}`);
+                if (handled && attempt === 1) continue;
+                return { html: '', statusCode: 0, domFallback: [], state: 'browser_error', reason: bErr.message };
+            }
+        }
+        return { html: '', statusCode: 0, domFallback: [], state: 'browser_error', reason: 'Playwright attempts exhausted' };
     };
 
     // 1. Collect target ASINs from asins and productUrls
@@ -124,7 +271,11 @@ try {
         }
     }
 
-    if (targetAsins.size === 0 && (!Array.isArray(searchKeywords) || searchKeywords.length === 0)) {
+    const effectiveSearchKeywords = Array.isArray(searchKeywords)
+        ? searchKeywords.filter((k) => typeof k === 'string' && k.trim())
+        : [];
+
+    if (targetAsins.size === 0 && effectiveSearchKeywords.length === 0) {
         targetAsins.add('B08N5WRWNW');
         targetAsins.add('B09XS7JWHH');
     }
@@ -138,43 +289,21 @@ try {
             log.info(`Fetching Amazon product: ${productUrl}`);
 
             let product = null;
-
-            // Strategy A: gotScraping
-            try {
-                const response = await gotScraping({
-                    url: productUrl,
-                    proxyUrl,
-                    headers: {
-                        'accept-language': 'en-US,en;q=0.9',
-                        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                    },
-                    timeout: { request: 25000 },
-                });
-
-                const html = response.body;
-                if (!html.includes('api-services-support@amazon.com') && !html.includes('Enter the characters you see below')) {
-                    product = parseAmazonProductHtml(html, asin, amazonDomain);
-                }
-            } catch (gotErr) {
-                await rotateOrDisableProxy(gotErr);
-                log.debug(`gotScraping failed for ${asin}: ${gotErr.message}`);
+            const httpRes = await fetchHtmlWithHttp(productUrl);
+            if (httpRes.state === 'ok') {
+                product = parseAmazonProductHtml(httpRes.html, asin, amazonDomain);
             }
 
-            // Strategy B: Browser fallback if blocked
-            if (!product || !product.title) {
-                try {
-                    log.info(`Using browser fallback for ASIN: ${asin}...`);
-                    const b = await getBrowser();
-                    const page = await b.newPage();
-                    await page.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
-                    await page.waitForTimeout(2000);
+            let finalState = httpRes.state;
+            let finalReason = httpRes.reason;
 
-                    const html = await page.content();
-                    product = parseAmazonProductHtml(html, asin, amazonDomain);
-                    await page.close();
-                } catch (bErr) {
-                    await rotateOrDisableProxy(bErr);
-                    log.warning(`Browser fallback error for ${asin}: ${bErr.message}`);
+            if ((!product || !product.title) && httpRes.state !== 'unavailable') {
+                log.info(`Using browser fallback for ASIN: ${asin} (HTTP state=${httpRes.state})...`);
+                const pwRes = await fetchWithPlaywright(productUrl, 'product');
+                finalState = pwRes.state;
+                finalReason = pwRes.reason;
+                if (pwRes.state === 'ok') {
+                    product = parseAmazonProductHtml(pwRes.html, asin, amazonDomain);
                 }
             }
 
@@ -183,56 +312,56 @@ try {
                 totalProductsScraped++;
                 if (product.inStock) inStockCount++;
                 if (product.isPrime) primeProductsCount++;
-
+                diagnostics.push({ target: asin, mode: 'asin', state: 'ok', itemsExtracted: 1 });
                 log.info(`[${totalProductsScraped}] Scraped ASIN ${asin}: "${product.title.slice(0, 45)}..." | Price: ${product.currency} ${product.price ?? 'N/A'}`);
             } else {
-                log.warning(`Could not extract valid data for ASIN: ${asin}`);
+                diagnostics.push({ target: asin, mode: 'asin', state: finalState, reason: finalReason, itemsExtracted: 0 });
+                log.warning(`Could not extract valid data for ASIN: ${asin} (state=${finalState}: ${finalReason})`);
             }
 
-            // Polite delay between requests
-            await new Promise((r) => setTimeout(r, 1500));
+            await new Promise((r) => setTimeout(r, 1200));
         }
     }
 
     // 2. Process Search Keywords
-    if (Array.isArray(searchKeywords) && searchKeywords.length > 0) {
-        log.info(`Searching Amazon for ${searchKeywords.length} keywords...`);
+    if (effectiveSearchKeywords.length > 0) {
+        log.info(`Searching Amazon for ${effectiveSearchKeywords.length} keyword(s)...`);
 
-        for (const keyword of searchKeywords) {
+        for (const keyword of effectiveSearchKeywords) {
             log.info(`Searching Amazon for: "${keyword}" (max: ${maxProducts})`);
             const searchUrl = `https://www.${amazonDomain}/s?k=${encodeURIComponent(keyword)}`;
 
             try {
-                let html = null;
+                const httpRes = await fetchHtmlWithHttp(searchUrl);
+                let results = httpRes.state === 'ok' ? parseAmazonSearchHtml(httpRes.html, amazonDomain) : [];
+                let finalState = httpRes.state;
+                let finalReason = httpRes.reason;
 
-                try {
-                    const response = await gotScraping({
-                        url: searchUrl,
-                        proxyUrl,
-                        headers: {
-                            'accept-language': 'en-US,en;q=0.9',
-                            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                        },
-                        timeout: { request: 30000 },
-                    });
-                    html = response.body;
-                } catch (err) {
-                    await rotateOrDisableProxy(err);
-                    log.debug(`Direct search request failed: ${err.message}`);
+                if (results.length === 0) {
+                    log.info(`Using browser fallback for Amazon search: "${keyword}" (HTTP state=${httpRes.state})...`);
+                    const pwRes = await fetchWithPlaywright(searchUrl, 'search');
+                    finalState = pwRes.state;
+                    finalReason = pwRes.reason;
+                    if (pwRes.state === 'ok') {
+                        results = parseAmazonSearchHtml(pwRes.html, amazonDomain);
+                        if (results.length === 0 && pwRes.domFallback.length > 0) {
+                            const currency = domainToCurrency(amazonDomain);
+                            results = pwRes.domFallback.map((d) => ({
+                                asin: d.asin,
+                                title: d.title,
+                                price: parseAmazonPrice(d.priceText),
+                                currency,
+                                rating: parseAmazonRating(d.ratingText),
+                                thumbnail: d.thumbnail,
+                                isPrime: d.isPrime,
+                                url: (d.href.startsWith('http') ? d.href : `https://www.${amazonDomain}${d.href}`).split('?')[0],
+                                scrapedAt: new Date().toISOString(),
+                            }));
+                        }
+                    }
                 }
 
-                if (!html || html.includes('api-services-support@amazon.com') || html.includes('Enter the characters you see below')) {
-                    const b = await getBrowser();
-                    const page = await b.newPage();
-                    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
-                    await page.waitForTimeout(2000);
-                    html = await page.content();
-                    await page.close();
-                }
-
-                const results = parseAmazonSearchHtml(html, amazonDomain);
                 const sliced = results.slice(0, maxProducts);
-
                 for (const item of sliced) {
                     item.searchKeyword = keyword;
                     await Actor.pushData(sanitizeRecord(item));
@@ -240,37 +369,49 @@ try {
                     if (item.isPrime) primeProductsCount++;
                 }
 
-                log.info(`Extracted ${sliced.length} search results for "${keyword}"`);
+                diagnostics.push({
+                    target: keyword,
+                    mode: 'search',
+                    state: sliced.length > 0 ? 'ok' : finalState,
+                    reason: sliced.length > 0 ? 'OK' : finalReason,
+                    itemsExtracted: sliced.length,
+                });
 
+                if (sliced.length > 0) {
+                    log.info(`Extracted ${sliced.length} search results for "${keyword}"`);
+                } else {
+                    log.warning(`Extracted 0 search results for "${keyword}" (state=${finalState}: ${finalReason})`);
+                }
             } catch (searchErr) {
+                diagnostics.push({ target: keyword, mode: 'search', state: 'error', reason: searchErr.message, itemsExtracted: 0 });
                 log.error(`Error searching Amazon for "${keyword}": ${searchErr.message}`);
             }
         }
     }
 
-    if (browser) {
-        await browser.close();
-    }
+    await closeBrowser();
 
-    // Save final executive summary
     const summary = {
         totalProductsScraped,
         inStockCount,
         primeProductsCount,
         domain: amazonDomain,
         status: totalProductsScraped > 0 ? 'SUCCEEDED' : 'FAILED',
+        diagnostics,
         scrapedAt: new Date().toISOString(),
     };
 
     await Actor.setValue('OUTPUT', summary);
     if (totalProductsScraped === 0) {
-        await Actor.fail('Extracted 0 products. Verify target URLs, keywords, or proxy configuration.');
+        const lastDiag = diagnostics[diagnostics.length - 1];
+        const hint = lastDiag?.reason ? ` Last diagnostic: ${lastDiag.state} (${lastDiag.reason}).` : '';
+        await Actor.fail(`Extracted 0 products.${hint} Note: Apify Free Datacenter Proxy restricts amazon.com — use RESIDENTIAL proxy group or direct IP.`);
     }
     log.info(`Amazon Scraping finished successfully! Total items: ${totalProductsScraped}`);
-
 } catch (err) {
     log.error(`Fatal execution error: ${err.message}`, { stack: err.stack });
-    await Actor.setValue('OUTPUT', { status: 'FAILED', error: err.message });
+    await closeBrowser().catch(() => {});
+    await Actor.setValue('OUTPUT', { status: 'FAILED', error: err.message, diagnostics });
     await Actor.fail(err.message);
 } finally {
     await Actor.exit();
