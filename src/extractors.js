@@ -264,10 +264,19 @@ export function parseAmazonSearchHtml(html, domain = 'amazon.com') {
         // Prime
         const isPrime = cardHtml.includes('aria-label="Amazon Prime"') || cardHtml.includes('a-icon-prime');
 
+        let currency = 'USD';
+        if (domain.includes('.co.uk')) currency = 'GBP';
+        else if (domain.includes('.de') || domain.includes('.fr') || domain.includes('.es') || domain.includes('.it')) currency = 'EUR';
+        else if (domain.includes('.ca')) currency = 'CAD';
+        else if (domain.includes('.co.jp')) currency = 'JPY';
+        else if (domain.includes('.sa')) currency = 'SAR';
+        else if (domain.includes('.ae')) currency = 'AED';
+
         results.push({
             asin,
             title,
             price,
+            currency,
             rating,
             thumbnail,
             isPrime,
